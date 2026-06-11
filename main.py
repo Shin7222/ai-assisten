@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-My AI CLI — OpenRouter + Tool Calling
+My AI CLI — Ollama + Tool Calling
 Fitur: baca/tulis file, edit kode, web search, akses folder
 """
 
@@ -20,18 +20,43 @@ except ImportError:
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-HISTORY_FILE     = Path.home() / ".my_ai_history.json"
-OPENROUTER_URL   = "https://api.openai.com/v1/chat/completions"
+HISTORY_FILE     = Path(__file__).parent / "history" / "history.json"
+OLLAMA_URL       = "http://localhost:11434/api/chat"
 MAX_FILE_BYTES   = 100_000   # batas baca file ~100 KB
 MAX_SEARCH_CHARS = 3_000     # batas karakter hasil search
 
 MODELS = {
-    "1": ("anthropic/claude-3.5-haiku",             "Claude 3.5 Haiku"),
-    "2": ("anthropic/claude-sonnet-4",               "Claude Sonnet 4"),
-    "3": ("anthropic/claude-opus-4",                 "Claude Opus 4"),
-    "4": ("google/gemini-2.0-flash-exp:free",        "Gemini 2.0 Flash (gratis)"),
-    "5": ("meta-llama/llama-3.3-70b-instruct:free",  "Llama 3.3 70B (gratis)"),
+    "1": ("llama3.2:latest", "Llama 3.2 (latest)"),
 }
+
+# ─── VOICEVOX (Text-to-Speech) ─────────────────────────────────────────────────
+# Aplikasi VOICEVOX harus dijalankan terpisah (https://voicevox.hiroshiba.jp/),
+# berjalan sebagai server lokal di port 50021.
+VOICEVOX_URL     = "http://127.0.0.1:50021"
+VOICEVOX_SPEAKER = 3   # 3 = Zundamon (Normal). Lihat /speakers utk daftar lengkap.
+VOICE_ENABLED    = False  # toggle via /voice
+
+# ─── Whitelist direktori ───────────────────────────────────────────────────────
+# Tools file hanya boleh akses path di dalam ALLOWED_ROOT (mencegah AI
+# membaca/menulis file di luar working directory project, mis. ~/.ssh).
+ALLOWED_ROOT = Path(".").resolve()
+
+def set_allowed_root(path: Path):
+    global ALLOWED_ROOT
+    ALLOWED_ROOT = path.resolve()
+
+def check_path(path: str) -> tuple[Path, str]:
+    """Resolve path & pastikan berada di dalam ALLOWED_ROOT.
+    Return (resolved_path, error_msg). error_msg kosong jika aman."""
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        p = (ALLOWED_ROOT / p)
+    p = p.resolve()
+    try:
+        p.relative_to(ALLOWED_ROOT)
+    except ValueError:
+        return p, f"❌ Akses ditolak: '{p}' berada di luar direktori yang diizinkan ({ALLOWED_ROOT})"
+    return p, ""
 
 PERSONA_NAMA   = "My AI"
 PERSONA_PROMPT = (
@@ -42,7 +67,13 @@ PERSONA_PROMPT = (
     "- Researcher: mencari informasi terkini di internet lalu merangkumnya.\n\n"
     "Gunakan tools yang tersedia secara proaktif tanpa perlu diminta eksplisit. "
     "Selalu jelaskan dengan singkat apa yang sedang kamu lakukan sebelum mengeksekusi tool. "
-    "Untuk tugas besar, pecah menjadi langkah-langkah kecil dan laporkan progresnya."
+    "Untuk tugas besar, pecah menjadi langkah-langkah kecil dan laporkan progresnya.\n\n"
+    "Gaya respons:\n"
+    "- Untuk sapaan kasual (hai, halo, pagi, makasih, dll), basa-basi sehari-hari, "
+    "atau pesan tes singkat (test, tes, ping, cek), balas SANGAT SINGKAT (1 kalimat pendek "
+    "atau bahkan beberapa kata saja), santai, tanpa basa-basi tambahan dan tanpa tools.\n"
+    "- Untuk pertanyaan/tugas yang butuh penjelasan, kerja teknis, atau analisis, "
+    "balas selengkap dan sejelas yang dibutuhkan seperti biasa."
 )
 
 # ─── Warna ────────────────────────────────────────────────────────────────────
@@ -52,6 +83,99 @@ CYAN="\033[96m"; GREEN="\033[92m"; YELLOW="\033[93m"; RED="\033[91m"; MAGENTA="\
 
 def c(text, color): return f"{color}{text}{R}"
 def yn(prompt): return input(f"{YELLOW}⚠ {prompt} [y/N]: {R}").strip().lower() == "y"
+
+# ─── VOICEVOX TTS ──────────────────────────────────────────────────────────────
+
+_TEMP_VOICE_FILE = Path(__file__).parent / "history" / "_voice_tmp.wav"
+
+def voicevox_check() -> bool:
+    """Cek apakah server VOICEVOX berjalan."""
+    try:
+        r = requests.get(f"{VOICEVOX_URL}/version", timeout=3)
+        return r.ok
+    except Exception:
+        return False
+
+
+def voicevox_speakers() -> list:
+    """Ambil daftar speaker/karakter yang tersedia."""
+    try:
+        r = requests.get(f"{VOICEVOX_URL}/speakers", timeout=5)
+        if not r.ok: return []
+        out = []
+        for sp in r.json():
+            for style in sp.get("styles", []):
+                out.append((style["id"], f"{sp['name']} - {style['name']}"))
+        return out
+    except Exception:
+        return []
+
+
+def _clean_text_for_tts(text: str) -> str:
+    """Buang markdown/simbol yang aneh kalau dibaca TTS."""
+    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)   # blok kode
+    text = re.sub(r'`([^`]*)`', r'\1', text)                  # inline code
+    text = re.sub(r'[*_#>~\[\]()]', '', text)                 # markdown chars
+    text = re.sub(r'https?://\S+', '', text)                  # URL
+    text = re.sub(r'\n+', '. ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def _play_audio_file(path: Path):
+    """Putar file audio secara cross-platform (blocking)."""
+    system = sys.platform
+    try:
+        if system.startswith("win"):
+            import winsound
+            winsound.PlaySound(str(path), winsound.SND_FILENAME)
+        elif system == "darwin":
+            subprocess.run(["afplay", str(path)], check=False)
+        else:  # linux
+            for player in (["paplay"], ["aplay"], ["ffplay", "-nodisp", "-autoexit"]):
+                if subprocess.run(["which", player[0]], capture_output=True).returncode == 0:
+                    subprocess.run(player + [str(path)], check=False,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return
+    except Exception as e:
+        print(f"  {DIM}(gagal memutar audio: {e}){R}")
+
+
+def speak_text(text: str) -> str:
+    """Sintesis teks via VOICEVOX lalu mainkan audionya. Return pesan status."""
+    text = _clean_text_for_tts(text)
+    if not text:
+        return "ℹ️ Tidak ada teks untuk dibacakan."
+
+    try:
+        # 1) audio_query: bangun parameter prosodi dari teks
+        q = requests.post(
+            f"{VOICEVOX_URL}/audio_query",
+            params={"text": text, "speaker": VOICEVOX_SPEAKER},
+            timeout=15,
+        )
+        q.raise_for_status()
+
+        # 2) synthesis: render WAV dari query
+        s = requests.post(
+            f"{VOICEVOX_URL}/synthesis",
+            params={"speaker": VOICEVOX_SPEAKER},
+            json=q.json(),
+            timeout=30,
+        )
+        s.raise_for_status()
+
+        _TEMP_VOICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _TEMP_VOICE_FILE.write_bytes(s.content)
+        _play_audio_file(_TEMP_VOICE_FILE)
+        return "✅ Suara diputar."
+    except requests.exceptions.ConnectionError:
+        return ("❌ Tidak bisa terhubung ke VOICEVOX. "
+                "Pastikan aplikasi VOICEVOX terbuka (server di :50021).")
+    except Exception as e:
+        return f"❌ TTS gagal: {e}"
+
+
 
 # ─── Tool definitions (dikirim ke API) ────────────────────────────────────────
 
@@ -175,12 +299,29 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Jalankan perintah shell/terminal (misal: pip install, npm run build, git status, pytest). Selalu meminta konfirmasi user sebelum eksekusi karena bisa berdampak luas.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Perintah shell yang akan dijalankan"},
+                    "cwd":     {"type": "string", "description": "Direktori tempat menjalankan command, relatif terhadap working directory. Default direktori kerja saat ini"},
+                    "timeout": {"type": "integer", "description": "Batas waktu eksekusi dalam detik, default 60"}
+                },
+                "required": ["command"]
+            }
+        }
+    },
 ]
 
 # ─── Tool implementations ─────────────────────────────────────────────────────
 
 def tool_read_file(path: str) -> str:
-    p = Path(path).expanduser().resolve()
+    p, err = check_path(path)
+    if err: return err
     if not p.exists():    return f"❌ File tidak ditemukan: {p}"
     if not p.is_file():   return f"❌ Bukan file: {p}"
     size = p.stat().st_size
@@ -196,7 +337,8 @@ def tool_read_file(path: str) -> str:
 
 
 def tool_write_file(path: str, content: str) -> str:
-    p = Path(path).expanduser().resolve()
+    p, err = check_path(path)
+    if err: return err
     exists = p.exists()
     action = "menimpa" if exists else "membuat"
     if not yn(f"AI ingin {action} file: {p}"):
@@ -211,7 +353,8 @@ def tool_write_file(path: str, content: str) -> str:
 
 
 def tool_edit_file(path: str, old_str: str, new_str: str) -> str:
-    p = Path(path).expanduser().resolve()
+    p, err = check_path(path)
+    if err: return err
     if not p.exists(): return f"❌ File tidak ditemukan: {p}"
     try:
         content = p.read_text(encoding="utf-8", errors="replace")
@@ -235,7 +378,8 @@ def tool_edit_file(path: str, old_str: str, new_str: str) -> str:
 
 
 def tool_list_dir(path: str = ".", recursive: bool = False) -> str:
-    p = Path(path).expanduser().resolve()
+    p, err = check_path(path)
+    if err: return err
     if not p.exists():   return f"❌ Path tidak ditemukan: {p}"
     if not p.is_dir():   return f"❌ Bukan direktori: {p}"
     try:
@@ -258,7 +402,8 @@ def tool_list_dir(path: str = ".", recursive: bool = False) -> str:
 
 
 def tool_search_in_files(pattern: str, directory: str = ".", extension: str = "") -> str:
-    base = Path(directory).expanduser().resolve()
+    base, err = check_path(directory)
+    if err: return err
     if not base.exists(): return f"❌ Direktori tidak ditemukan: {base}"
     results = []
     glob = f"*{extension}" if extension else "*"
@@ -284,26 +429,61 @@ def tool_search_in_files(pattern: str, directory: str = ".", extension: str = ""
 
 
 def tool_web_search(query: str) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
+    # ── 1. Coba HTML scrape (hasil lebih kaya) ──
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        url     = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
-        resp    = requests.get(url, headers=headers, timeout=10)
+        url  = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
         raw     = resp.text
         results = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', raw, re.DOTALL)
         titles  = re.findall(r'class="result__a"[^>]*>(.*?)</a>', raw, re.DOTALL)
         def clean(s): return re.sub(r'<[^>]+>', '', s).strip()
-        items   = []
+        items = []
         for t, r in zip(titles[:5], results[:5]):
-            items.append(f"• {clean(t)}\n  {clean(r)}")
-        if not items:
-            return f"🌐 Tidak ada hasil untuk: {query}"
-        return f"🌐 Hasil web search: '{query}'\n\n" + "\n\n".join(items)
+            ct, cr = clean(t), clean(r)
+            if ct or cr:
+                items.append(f"• {ct}\n  {cr}")
+        if items:
+            return f"🌐 Hasil web search: '{query}'\n\n" + "\n\n".join(items)
+    except requests.exceptions.RequestException:
+        pass  # lanjut ke fallback
+
+    # ── 2. Fallback: DuckDuckGo Instant Answer API (lebih jarang diblokir) ──
+    try:
+        url  = "https://api.duckduckgo.com/"
+        resp = requests.get(url, params={
+            "q": query, "format": "json", "no_html": "1", "skip_disambig": "1"
+        }, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        items = []
+        if data.get("AbstractText"):
+            items.append(f"• {data.get('Heading', query)}\n  {data['AbstractText']}")
+        for topic in data.get("RelatedTopics", [])[:5]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                items.append(f"• {topic['Text']}")
+        if items:
+            return f"🌐 Hasil web search: '{query}'\n\n" + "\n\n".join(items[:5])
+        return f"🌐 Tidak ada hasil untuk: {query}"
+    except requests.exceptions.ConnectionError as e:
+        return (f"❌ Web search gagal: tidak bisa terhubung ke internet "
+                f"(cek koneksi/firewall/DNS).\nDetail: {e}")
+    except requests.exceptions.Timeout:
+        return "❌ Web search gagal: timeout, coba lagi."
     except Exception as e:
         return f"❌ Web search gagal: {e}"
 
 
 def tool_create_dir(path: str) -> str:
-    p = Path(path).expanduser().resolve()
+    p, err = check_path(path)
+    if err: return err
     if p.exists(): return f"ℹ️ Direktori sudah ada: {p}"
     if not yn(f"AI ingin membuat direktori: {p}"):
         return "❌ Dibatalkan oleh user."
@@ -377,6 +557,43 @@ def tool_open_app(target: str, args: list = None) -> str:
         return f"❌ Gagal membuka '{target}': {e}"
 
 
+MAX_CMD_OUTPUT = 5_000  # batas karakter output command
+
+def tool_run_command(command: str, cwd: str = "", timeout: int = 60) -> str:
+    # Tentukan & validasi cwd
+    if cwd:
+        run_dir, err = check_path(cwd)
+        if err: return err
+        if not run_dir.is_dir():
+            return f"❌ Direktori tidak ditemukan: {run_dir}"
+    else:
+        run_dir = ALLOWED_ROOT
+
+    timeout = min(max(int(timeout or 60), 1), 300)  # clamp 1-300 detik
+
+    print(f"\n  {DIM}Perintah:{R} {YELLOW}{command}{R}")
+    print(f"  {DIM}Direktori:{R} {run_dir}")
+    if not yn(f"AI ingin menjalankan perintah shell di atas"):
+        return "❌ Dibatalkan oleh user."
+
+    try:
+        result = subprocess.run(
+            command, shell=True, cwd=str(run_dir),
+            capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace",
+        )
+        out = (result.stdout or "") + (result.stderr or "")
+        out = out.strip() or "(tidak ada output)"
+        if len(out) > MAX_CMD_OUTPUT:
+            out = out[:MAX_CMD_OUTPUT] + f"\n... (terpotong, total {len(out):,} karakter)"
+        status = "✅" if result.returncode == 0 else f"⚠️ exit code {result.returncode}"
+        return f"{status}\n$ {command}\n\n{out}"
+    except subprocess.TimeoutExpired:
+        return f"❌ Perintah timeout setelah {timeout} detik: {command}"
+    except Exception as e:
+        return f"❌ Gagal menjalankan perintah: {e}"
+
+
 TOOL_MAP = {
     "read_file":       lambda a: tool_read_file(**a),
     "write_file":      lambda a: tool_write_file(**a),
@@ -386,52 +603,88 @@ TOOL_MAP = {
     "web_search":      lambda a: tool_web_search(**a),
     "create_dir":      lambda a: tool_create_dir(**a),
     "open_app":        lambda a: tool_open_app(**a),
+    "run_command":     lambda a: tool_run_command(**a),
 }
 
-# ─── OpenRouter API ───────────────────────────────────────────────────────────
+# ─── Ollama API ───────────────────────────────────────────────────────────────
 
-def call_api(api_key: str, model: str, messages: list, use_tools: bool = True) -> dict:
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
-        "HTTP-Referer":  "https://my-ai-cli",
-        "X-Title":       "My AI CLI",
+def call_api_stream(model: str, messages: list, use_tools: bool = True):
+    """Generator: yield potongan JSON dari respons stream Ollama (NDJSON)."""
+    body = {
+        "model":    model,
+        "messages": messages,
+        "stream":   True,
+        "options":  {"num_predict": 4096},
     }
-    body = {"model": model, "messages": messages, "max_tokens": 4096}
     if use_tools:
         body["tools"] = TOOLS
 
-    resp = requests.post(OPENROUTER_URL, headers=headers, json=body, timeout=120)
-    if resp.status_code == 401: raise ValueError("API key tidak valid.")
-    if resp.status_code == 402: raise ValueError("Saldo OpenRouter habis.")
-    if resp.status_code == 429: raise ValueError("Rate limit. Tunggu sebentar.")
-    if not resp.ok:             raise ValueError(f"HTTP {resp.status_code}: {resp.text[:300]}")
-    return resp.json()
+    resp = requests.post(OLLAMA_URL, json=body, timeout=120, stream=True)
+    if not resp.ok:
+        raise ValueError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+
+    for line in resp.iter_lines():
+        if not line:
+            continue
+        try:
+            yield json.loads(line.decode("utf-8"))
+        except json.JSONDecodeError:
+            continue
 
 
 def process_response(api_key: str, model: str, messages: list) -> str:
-    """Agentic loop: terus panggil API sampai tidak ada tool call."""
+    """Agentic loop dengan streaming: print teks live, handle tool_calls."""
     while True:
-        data    = call_api(api_key, model, messages)
-        choice  = data["choices"][0]
-        message = choice["message"]
-        finish  = choice.get("finish_reason", "")
+        full_content = ""
+        tool_calls    = []
+        printed_label = False
 
-        # Tambah respons assistant ke messages
-        messages.append(message)
+        for chunk in call_api_stream(model, messages):
+            msg = chunk.get("message", {})
 
-        # Kalau tidak ada tool call → kembalikan teks
-        tool_calls = message.get("tool_calls") or []
+            # Streaming teks → print langsung token-per-token
+            piece = msg.get("content", "")
+            if piece:
+                if not printed_label:
+                    print(f"\n{CYAN}{BOLD}AI ▸{R} ", end="", flush=True)
+                    printed_label = True
+                print(piece, end="", flush=True)
+                full_content += piece
+
+            # tool_calls biasanya muncul utuh di chunk terakhir
+            if msg.get("tool_calls"):
+                tool_calls = msg["tool_calls"]
+
+            if chunk.get("done"):
+                break
+
+        if printed_label:
+            print()  # newline setelah selesai streaming teks
+
+        # Susun pesan assistant lengkap untuk history
+        assistant_msg = {"role": "assistant", "content": full_content}
+        if tool_calls:
+            assistant_msg["tool_calls"] = tool_calls
+        messages.append(assistant_msg)
+
+        # Kalau tidak ada tool call → selesai, kembalikan teks (sudah diprint)
         if not tool_calls:
-            return message.get("content") or ""
+            if VOICE_ENABLED and full_content.strip():
+                status = speak_text(full_content)
+                if status.startswith("❌"):
+                    print(f"  {DIM}{status}{R}")
+            return ""  # konten sudah diprint live, tidak perlu diprint ulang
 
         # Eksekusi semua tool calls
         for tc in tool_calls:
+            # Ollama: tc["function"]["name"] dan tc["function"]["arguments"] (dict langsung)
             fn_name = tc["function"]["name"]
-            try:
-                fn_args = json.loads(tc["function"]["arguments"])
-            except Exception:
-                fn_args = {}
+            fn_args = tc["function"].get("arguments", {})
+            if isinstance(fn_args, str):
+                try:
+                    fn_args = json.loads(fn_args)
+                except Exception:
+                    fn_args = {}
 
             # Tampilkan apa yang AI lakukan
             print(f"\n  {MAGENTA}🔧 {fn_name}{R}({DIM}{', '.join(f'{k}={repr(v)[:60]}' for k,v in fn_args.items())}{R})")
@@ -445,11 +698,10 @@ def process_response(api_key: str, model: str, messages: list) -> str:
             preview = result[:200].replace("\n", " ")
             print(f"  {DIM}→ {preview}{'...' if len(result)>200 else ''}{R}\n")
 
-            # Kirim hasil tool ke messages
+            # Kirim hasil tool ke messages (format Ollama)
             messages.append({
-                "role":         "tool",
-                "tool_call_id": tc["id"],
-                "content":      result,
+                "role":    "tool",
+                "content": result,
             })
 
 
@@ -457,7 +709,7 @@ def process_response(api_key: str, model: str, messages: list) -> str:
 
 def load_config() -> dict:
     return {
-        "api_key":       os.environ.get("OPENROUTER_API_KEY", ""),
+        "api_key":       "",  # Ollama tidak butuh API key
         "default_model": os.environ.get("MY_AI_DEFAULT_MODEL", ""),
     }
 
@@ -491,7 +743,9 @@ def load_history() -> list:
     return []
 
 def save_history(history: list):
-    try: HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
     except: pass
 
 def show_history(history: list):
@@ -507,28 +761,82 @@ def show_history(history: list):
         print(f"  {DIM}{i:>2}.{R} {WHITE}{msg:<38}{R}  {DIM}{ts}  {mdl}{R}")
     print(f"{BOLD}{'─'*56}{R}\n")
 
+
+def list_sessions(history: list) -> list:
+    """Tampilkan daftar sesi yang bisa di-resume, return list referensi sesi."""
+    if not history:
+        print(f"\n{YELLOW}Belum ada sesi tersimpan.{R}\n"); return []
+    shown = history[-15:]
+    print(f"\n{BOLD}{'─'*56}{R}")
+    print(f"{BOLD}  💬 Sesi tersimpan (ketik nomor untuk resume){R}")
+    print(f"{BOLD}{'─'*56}{R}")
+    for i, e in enumerate(shown, 1):
+        ts    = e.get("timestamp","")[:16].replace("T"," ")
+        msg   = e.get("user_first","")[:38]
+        mdl   = e.get("model","").split("/")[-1][:20]
+        nmsg  = len([m for m in e.get("messages",[]) if m.get("role") in ("user","assistant")])
+        print(f"  {CYAN}{i:>2}{R}. {WHITE}{msg:<38}{R}  {DIM}{ts}  {mdl}  ({nmsg} pesan){R}")
+    print(f"{BOLD}{'─'*56}{R}")
+    return shown
+
+
+def load_session_messages(entry: dict, system_msg: dict) -> list:
+    """Bangun ulang list `messages` dari entry history, prefix dengan system_msg."""
+    restored = [system_msg]
+    for m in entry.get("messages", []):
+        # Skip pesan tool/tool_calls yang bisa membingungkan model saat resume
+        if m.get("role") == "tool":
+            continue
+        if m.get("role") == "assistant" and m.get("tool_calls") and not m.get("content"):
+            continue
+        restored.append({k: v for k, v in m.items() if k in ("role", "content")})
+    return restored
+
 # ─── Setup prompts ────────────────────────────────────────────────────────────
 
+def fetch_ollama_models() -> list:
+    """Ambil daftar model yang sudah di-pull di Ollama lokal."""
+    try:
+        resp = requests.get("http://localhost:11434/api/tags", timeout=5)
+        if not resp.ok: return []
+        data = resp.json()
+        return [m["name"] for m in data.get("models", [])]
+    except Exception:
+        return []
+
+
 def pilih_model(default_model: str = "") -> tuple:
-    # Cari nomor default dari config
-    default_key = "1"
-    for k,(mid,_) in MODELS.items():
-        if mid == default_model:
-            default_key = k; break
+    detected = fetch_ollama_models()
+
+    # Susun daftar pilihan: model terdeteksi dulu, lalu fallback MODELS
+    options = {}
+    if detected:
+        for i, name in enumerate(detected, 1):
+            options[str(i)] = (name, name)
+    else:
+        options.update(MODELS)
+
+    custom_key = str(len(options) + 1)
+
+    # Cari nomor default
+    default_key = next((k for k,(mid,_) in options.items() if mid == default_model), "1")
 
     print(f"{BOLD}Pilih model:{R}")
-    for k,(mid,desc) in MODELS.items():
+    if detected:
+        print(f"  {DIM}(terdeteksi dari 'ollama list'){R}")
+    for k,(mid,desc) in options.items():
         marker = f"  {GREEN}← tersimpan{R}" if mid == default_model else ""
-        print(f"  {CYAN}{k}{R}. {desc}  {DIM}({mid}){R}{marker}")
-    print(f"  {CYAN}6{R}. Ketik model ID sendiri\n")
+        print(f"  {CYAN}{k}{R}. {desc}{marker}")
+    print(f"  {CYAN}{custom_key}{R}. Ketik model ID sendiri (contoh: llama3.1:8b, mistral)\n")
+
     while True:
-        p = input(f"{DIM}Pilih [1-6, default={default_key}]: {R}").strip() or default_key
-        if p in MODELS:
-            mid, desc = MODELS[p]
+        p = input(f"{DIM}Pilih [1-{custom_key}, default={default_key}]: {R}").strip() or default_key
+        if p in options:
+            mid, desc = options[p]
             save_config({"default_model": mid})
             print(f"\n{GREEN}✓ {desc}{R}\n"); return mid, desc
-        elif p == "6":
-            mid = input("Model ID: ").strip()
+        elif p == custom_key:
+            mid = input("Model ID (misal llama3.1:8b): ").strip()
             if mid:
                 save_config({"default_model": mid})
                 print(f"\n{GREEN}✓ {mid}{R}\n"); return mid, mid
@@ -559,6 +867,8 @@ def help_text():
 {BOLD}Perintah:{R}
   {CYAN}/clear{R}    — Reset konteks percakapan
   {CYAN}/history{R}  — Lihat history chat
+  {CYAN}/sessions{R} — Lihat & lanjutkan (resume) sesi lama
+  {CYAN}/voice{R}    — Aktifkan/nonaktifkan suara AI (VOICEVOX). /voice on|off|list|set <id>
   {CYAN}/persona{R}  — Ganti persona
   {CYAN}/model{R}    — Ganti model AI
   {CYAN}/cwd{R}      — Tampilkan & ganti working directory
@@ -581,28 +891,30 @@ def help_text():
 
 def main():
     print(f"\n{BOLD}{CYAN}{'═'*54}{R}")
-    print(f"{BOLD}{CYAN}   🤖  My AI CLI  —  OpenRouter + Tools{R}")
+    print(f"{BOLD}{CYAN}   🤖  My AI CLI  —  Ollama + Tools{R}")
     print(f"{BOLD}{CYAN}{'═'*54}{R}\n")
 
-    cfg     = load_config()
-    api_key = os.environ.get("OPENROUTER_API_KEY","").strip() or cfg.get("api_key","")
-    if not api_key:
-        print(f"{YELLOW}API key belum disimpan.{R}")
-        print(f"{DIM}Daftar gratis: https://openrouter.ai/keys{R}\n")
-        api_key = input("Masukkan OPENROUTER_API_KEY: ").strip()
-        if not api_key:
-            print(f"{RED}❌ API key diperlukan.{R}"); return
-        save_config({"api_key": api_key})
-        env_path = Path(__file__).parent / ".env"
-        print(f"{GREEN}✓ API key disimpan di {env_path}{R}\n")
-    else:
-        print(f"{DIM}API key loaded ✓{R}")
+    cfg = load_config()
+
+    # Cek apakah Ollama berjalan
+    try:
+        ping = requests.get("http://localhost:11434/api/tags", timeout=5)
+        if ping.ok:
+            print(f"{GREEN}✓ Ollama terhubung{R}")
+        else:
+            print(f"{YELLOW}⚠ Ollama merespons dengan status {ping.status_code}{R}")
+    except requests.exceptions.ConnectionError:
+        print(f"{RED}❌ Ollama tidak berjalan. Jalankan: ollama serve{R}\n")
+        return
+
+    api_key = ""  # Ollama tidak butuh API key
 
     default_model = cfg.get("default_model", "")
     model_id, model_desc = pilih_model(default_model)
     persona_nama, sys_prompt = PERSONA_NAMA, PERSONA_PROMPT
 
     cwd = Path(".").resolve()
+    set_allowed_root(cwd)
     print(f"{DIM}Working directory: {cwd}{R}")
     print(f"{DIM}Ketik /help untuk melihat perintah.{R}\n")
 
@@ -620,6 +932,7 @@ def main():
     }
     messages     = [system_msg]
     all_history  = load_history()
+    current_session_idx = None  # index di all_history untuk sesi yang sedang aktif (None = sesi baru)
 
     while True:
         try:
@@ -637,10 +950,25 @@ def main():
 
             elif cmd == "/clear":
                 messages = [system_msg]
+                current_session_idx = None
                 print(f"\n{GREEN}✓ Konteks dihapus.{R}")
 
             elif cmd == "/history":
                 show_history(all_history)
+
+            elif cmd == "/sessions":
+                shown = list_sessions(all_history)
+                if shown:
+                    sel = input(f"  {DIM}Nomor sesi (kosongkan=batal): {R}").strip()
+                    if sel.isdigit() and 1 <= int(sel) <= len(shown):
+                        entry = shown[int(sel)-1]
+                        messages = load_session_messages(entry, system_msg)
+                        # cari index asli di all_history
+                        current_session_idx = all_history.index(entry)
+                        n = len([m for m in messages if m["role"] in ("user","assistant")])
+                        print(f"\n{GREEN}✓ Sesi dilanjutkan ({n} pesan dimuat).{R}")
+                    else:
+                        print(f"\n{YELLOW}Dibatalkan.{R}")
 
             elif cmd == "/persona":
                 print(f"\n{DIM}Persona tunggal aktif: {CYAN}{PERSONA_NAMA}{R}\n")
@@ -649,6 +977,7 @@ def main():
                 default_model = cfg.get("default_model", "")
                 model_id, model_desc = pilih_model(default_model)
                 messages = [system_msg]
+                current_session_idx = None
                 print(f"{DIM}Konteks direset.{R}")
 
             elif cmd == "/cwd":
@@ -657,6 +986,7 @@ def main():
                     new_cwd = Path(parts[1]).expanduser().resolve()
                     if new_cwd.is_dir():
                         os.chdir(new_cwd); cwd = new_cwd
+                        set_allowed_root(cwd)
                         system_msg["content"] = re.sub(
                             r"Working directory saat ini: .*",
                             f"Working directory saat ini: {cwd}",
@@ -672,6 +1002,7 @@ def main():
                         new_cwd = Path(new_path).expanduser().resolve()
                         if new_cwd.is_dir():
                             os.chdir(new_cwd); cwd = new_cwd
+                            set_allowed_root(cwd)
                             system_msg["content"] = re.sub(
                                 r"Working directory saat ini: .*",
                                 f"Working directory saat ini: {cwd}",
@@ -694,18 +1025,55 @@ def main():
                 else: print(f"\n{YELLOW}Belum ada percakapan.{R}")
 
             elif cmd == "/apikey":
-                new_key = input(f"  Masukkan API key baru: ").strip()
-                if new_key:
-                    api_key = new_key
-                    save_config({"api_key": new_key})
-                    print(f"\n{GREEN}✓ API key diperbarui dan disimpan.{R}\n")
+                print(f"\n{YELLOW}Ollama berjalan lokal, tidak memerlukan API key.{R}\n")
+
+            elif cmd == "/voice":
+                global VOICE_ENABLED, VOICEVOX_SPEAKER
+                parts = user_input.split(maxsplit=1)
+                arg = parts[1].lower() if len(parts) > 1 else ""
+
+                if arg == "on":
+                    if not voicevox_check():
+                        print(f"\n{RED}❌ VOICEVOX tidak terdeteksi di {VOICEVOX_URL}.{R}")
+                        print(f"{DIM}Buka aplikasi VOICEVOX terlebih dahulu, lalu coba lagi.{R}\n")
+                    else:
+                        VOICE_ENABLED = True
+                        print(f"\n{GREEN}✓ Voice aktif. Setiap balasan AI akan dibacakan.{R}\n")
+                elif arg == "off":
+                    VOICE_ENABLED = False
+                    print(f"\n{GREEN}✓ Voice nonaktif.{R}\n")
+                elif arg == "list":
+                    speakers = voicevox_speakers()
+                    if not speakers:
+                        print(f"\n{RED}❌ Tidak bisa ambil daftar speaker. VOICEVOX terbuka?{R}\n")
+                    else:
+                        print(f"\n{BOLD}Speaker VOICEVOX tersedia:{R}")
+                        for sid, name in speakers:
+                            mark = f"  {GREEN}← aktif{R}" if sid == VOICEVOX_SPEAKER else ""
+                            print(f"  {CYAN}{sid:>3}{R}  {name}{mark}")
+                        print(f"\n{DIM}Ganti dengan: /voice set <id>{R}\n")
+                elif arg.startswith("set"):
+                    sub = user_input.split()
+                    if len(sub) >= 3 and sub[2].isdigit():
+                        VOICEVOX_SPEAKER = int(sub[2])
+                        print(f"\n{GREEN}✓ Speaker diubah ke ID {VOICEVOX_SPEAKER}.{R}")
+                        print(f"{DIM}Lihat nama: /voice list{R}\n")
+                    else:
+                        print(f"\n{YELLOW}Pakai: /voice set <id_speaker>{R}\n")
                 else:
-                    print(f"\n{YELLOW}Dibatalkan.{R}\n")
+                    status = f"{GREEN}AKTIF{R}" if VOICE_ENABLED else f"{DIM}nonaktif{R}"
+                    connected = f"{GREEN}terhubung{R}" if voicevox_check() else f"{RED}tidak terhubung{R}"
+                    print(f"\n  Voice  : {status}")
+                    print(f"  VOICEVOX: {connected}  {DIM}({VOICEVOX_URL}){R}")
+                    print(f"  Speaker : {VOICEVOX_SPEAKER}")
+                    print(f"\n{DIM}Pakai: /voice on | off | list | set <id>{R}\n")
 
             elif cmd == "/info":
+                voice_status = f"{GREEN}ON{R}" if VOICE_ENABLED else f"{DIM}OFF{R}"
                 print(f"\n  Model  : {CYAN}{model_desc}{R}  {DIM}({model_id}){R}")
                 print(f"  Persona: {CYAN}{PERSONA_NAMA}{R}")
-                print(f"  CWD    : {CYAN}{cwd}{R}\n")
+                print(f"  CWD    : {CYAN}{cwd}{R}")
+                print(f"  Voice  : {voice_status}\n")
 
             elif cmd == "/help":
                 help_text()
@@ -715,20 +1083,17 @@ def main():
 
         # ── Kirim ke API ──
         messages.append({"role": "user", "content": user_input})
-        print(f"\n{DIM}Berpikir...{R}", end="\r", flush=True)
 
         try:
-            reply = process_response(api_key, model_id, messages)
+            process_response(api_key, model_id, messages)
         except ValueError as e:
             print(f"\n{RED}❌ {e}{R}\n"); messages.pop(); continue
         except requests.exceptions.ConnectionError:
-            print(f"\n{RED}❌ Tidak bisa terhubung. Cek internet.{R}\n"); messages.pop(); continue
+            print(f"\n{RED}❌ Tidak bisa terhubung ke Ollama. Pastikan 'ollama serve' berjalan.{R}\n"); messages.pop(); continue
         except Exception as e:
             print(f"\n{RED}❌ Error: {e}{R}\n"); messages.pop(); continue
 
-        print(" " * 30, end="\r")
-        if reply:
-            print(f"\n{CYAN}{BOLD}AI ▸{R} {reply}\n")
+        print()
 
         # Simpan history
         chat_msgs = [m for m in messages if m["role"] not in ("system","tool")
@@ -741,8 +1106,14 @@ def main():
             "user_first": first_user,
             "messages":   [m for m in messages if m["role"] != "system"],
         }
-        if len(chat_msgs) <= 2: all_history.append(entry)
-        elif all_history:       all_history[-1] = entry
+        if current_session_idx is not None and 0 <= current_session_idx < len(all_history):
+            entry["user_first"] = all_history[current_session_idx].get("user_first", first_user)
+            all_history[current_session_idx] = entry
+        elif len(chat_msgs) <= 2:
+            all_history.append(entry)
+            current_session_idx = len(all_history) - 1
+        elif all_history:
+            all_history[-1] = entry
         save_history(all_history)
 
 if __name__ == "__main__":
