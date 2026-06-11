@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-My AI CLI — Ollama + Tool Calling
+My AI CLI — Ollama / OpenRouter + Tool Calling
 Fitur: baca/tulis file, edit kode, web search, akses folder
+Provider: ollama (lokal) atau openrouter (cloud, butuh API key)
 """
 
 import os, json, datetime, subprocess, re, sys
@@ -21,12 +22,29 @@ except ImportError:
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 HISTORY_FILE     = Path(__file__).parent / "history" / "history.json"
-OLLAMA_URL       = "http://localhost:11434/api/chat"
 MAX_FILE_BYTES   = 100_000   # batas baca file ~100 KB
 MAX_SEARCH_CHARS = 3_000     # batas karakter hasil search
 
-MODELS = {
+# Provider: "ollama" atau "openrouter"
+PROVIDER         = "ollama"   # akan di-override di main()
+OLLAMA_URL       = "http://localhost:11434/api/chat"
+OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
+
+# Model fallback jika Ollama tidak bisa di-ping
+MODELS_OLLAMA = {
     "1": ("llama3.2:latest", "Llama 3.2 (latest)"),
+}
+
+# Model populer OpenRouter (gratis / murah)
+MODELS_OPENROUTER = {
+    "1":  ("meta-llama/llama-3.3-70b-instruct:free",    "Llama 3.3 70B (free)"),
+    "2":  ("meta-llama/llama-3.1-8b-instruct:free",     "Llama 3.1 8B (free)"),
+    "3":  ("mistralai/mistral-7b-instruct:free",         "Mistral 7B (free)"),
+    "4":  ("google/gemma-3-27b-it:free",                 "Gemma 3 27B (free)"),
+    "5":  ("deepseek/deepseek-r1:free",                  "DeepSeek R1 (free)"),
+    "6":  ("openai/gpt-4o-mini",                         "GPT-4o Mini"),
+    "7":  ("anthropic/claude-sonnet-4-5",                "Claude Sonnet 4.5"),
+    "8":  ("google/gemini-2.0-flash-exp:free",           "Gemini 2.0 Flash (free)"),
 }
 
 # ─── VOICEVOX (Text-to-Speech) ─────────────────────────────────────────────────
@@ -69,11 +87,15 @@ PERSONA_PROMPT = (
     "Selalu jelaskan dengan singkat apa yang sedang kamu lakukan sebelum mengeksekusi tool. "
     "Untuk tugas besar, pecah menjadi langkah-langkah kecil dan laporkan progresnya.\n\n"
     "Gaya respons:\n"
-    "- Untuk sapaan kasual (hai, halo, pagi, makasih, dll), basa-basi sehari-hari, "
-    "atau pesan tes singkat (test, tes, ping, cek), balas SANGAT SINGKAT (1 kalimat pendek "
-    "atau bahkan beberapa kata saja), santai, tanpa basa-basi tambahan dan tanpa tools.\n"
+    "- Untuk sapaan kasual (hai, halo, pagi, makasih, dll) atau basa-basi sehari-hari, "
+    "balas SANGAT SINGKAT (1 kalimat pendek atau beberapa kata saja), santai, "
+    "tanpa basa-basi tambahan dan tanpa tools, dalam Bahasa Indonesia.\n"
+    "- KHUSUS jika pesan user HANYA berupa kata 'test', 'tes', 'testing', 'cek', atau 'ping' "
+    "(tanpa konten lain), balas dengan SATU kalimat SANGAT PENDEK dalam BAHASA JEPANG saja "
+    "(contoh: 'テスト成功です！', 'はい、聞こえています！', 'マイクのテスト中だよ！'). "
+    "Tanpa terjemahan, tanpa romaji, tanpa penjelasan tambahan, tanpa tools.\n"
     "- Untuk pertanyaan/tugas yang butuh penjelasan, kerja teknis, atau analisis, "
-    "balas selengkap dan sejelas yang dibutuhkan seperti biasa."
+    "balas selengkap dan sejelas yang dibutuhkan seperti biasa dalam Bahasa Indonesia."
 )
 
 # ─── Warna ────────────────────────────────────────────────────────────────────
@@ -606,10 +628,23 @@ TOOL_MAP = {
     "run_command":     lambda a: tool_run_command(**a),
 }
 
-# ─── Ollama API ───────────────────────────────────────────────────────────────
+# ─── API (Ollama & OpenRouter) ────────────────────────────────────────────────
 
-def call_api_stream(model: str, messages: list, use_tools: bool = True):
-    """Generator: yield potongan JSON dari respons stream Ollama (NDJSON)."""
+def call_api_stream(model: str, messages: list, api_key: str = "", use_tools: bool = True):
+    """Generator: yield dict chunk dari respons stream.
+    Format output dinormalisasi agar process_response tidak perlu tahu providernya:
+      chunk["message"]["content"]    — potongan teks
+      chunk["message"]["tool_calls"] — list tool calls (opsional)
+      chunk["done"]                  — True ketika stream selesai
+    """
+    if PROVIDER == "openrouter":
+        yield from _stream_openrouter(model, messages, api_key, use_tools)
+    else:
+        yield from _stream_ollama(model, messages, use_tools)
+
+
+def _stream_ollama(model: str, messages: list, use_tools: bool = True):
+    """Stream dari Ollama — NDJSON, format asli sudah cocok."""
     body = {
         "model":    model,
         "messages": messages,
@@ -632,6 +667,111 @@ def call_api_stream(model: str, messages: list, use_tools: bool = True):
             continue
 
 
+def _stream_openrouter(model: str, messages: list, api_key: str, use_tools: bool = True):
+    """Stream dari OpenRouter — SSE format (data: {...}).
+    Normalisasi output ke format yang sama dengan Ollama."""
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY belum diset. Jalankan /apikey untuk mengisinya.")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type":  "application/json",
+        "HTTP-Referer":  "https://github.com/my-ai-cli",   # opsional, untuk analytics OR
+        "X-Title":       "My AI CLI",
+    }
+    body = {
+        "model":    model,
+        "messages": messages,
+        "stream":   True,
+        "max_tokens": 4096,
+    }
+    if use_tools:
+        body["tools"] = TOOLS
+
+    resp = requests.post(OPENROUTER_URL, json=body, headers=headers, timeout=120, stream=True)
+    if not resp.ok:
+        raise ValueError(f"HTTP {resp.status_code}: {resp.text[:400]}")
+
+    # Kumpulkan tool_call fragments (OpenRouter kirim delta per-chunk)
+    accumulated_tool_calls: dict = {}  # index → {id, type, function:{name, arguments}}
+
+    for raw_line in resp.iter_lines():
+        if not raw_line:
+            continue
+        line = raw_line.decode("utf-8").strip()
+        if line == "data: [DONE]":
+            # Flush tool_calls yang sudah terkumpul
+            if accumulated_tool_calls:
+                tcs = _finalize_tool_calls(accumulated_tool_calls)
+                yield {"message": {"content": "", "tool_calls": tcs}, "done": False}
+            yield {"message": {"content": ""}, "done": True}
+            return
+        if not line.startswith("data: "):
+            continue
+        try:
+            data = json.loads(line[6:])
+        except json.JSONDecodeError:
+            continue
+
+        choice = (data.get("choices") or [{}])[0]
+        delta  = choice.get("delta", {})
+
+        # Teks biasa
+        text_piece = delta.get("content") or ""
+
+        # Tool call deltas (OpenAI-style streaming tool calls)
+        tc_deltas = delta.get("tool_calls") or []
+        for tc_delta in tc_deltas:
+            idx = tc_delta.get("index", 0)
+            if idx not in accumulated_tool_calls:
+                accumulated_tool_calls[idx] = {
+                    "id":       tc_delta.get("id", ""),
+                    "type":     "function",
+                    "function": {"name": "", "arguments": ""},
+                }
+            acc = accumulated_tool_calls[idx]
+            fn  = tc_delta.get("function", {})
+            if fn.get("name"):
+                acc["function"]["name"] += fn["name"]
+            if fn.get("arguments"):
+                acc["function"]["arguments"] += fn["arguments"]
+            if tc_delta.get("id"):
+                acc["id"] = tc_delta["id"]
+
+        finish_reason = choice.get("finish_reason")
+        is_done = finish_reason in ("stop", "tool_calls", "length")
+
+        yield {"message": {"content": text_piece}, "done": False}
+
+        if is_done:
+            if accumulated_tool_calls:
+                tcs = _finalize_tool_calls(accumulated_tool_calls)
+                yield {"message": {"content": "", "tool_calls": tcs}, "done": False}
+            yield {"message": {"content": ""}, "done": True}
+            return
+
+
+def _finalize_tool_calls(accumulated: dict) -> list:
+    """Ubah dict index→fragment menjadi list tool_calls standar (seperti Ollama)."""
+    result = []
+    for idx in sorted(accumulated):
+        tc  = accumulated[idx]
+        raw = tc["function"]["arguments"]
+        try:
+            args = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            args = {"_raw": raw}
+        result.append({
+            "id":   tc.get("id", f"call_{idx}"),
+            "type": "function",
+            "function": {
+                "name":      tc["function"]["name"],
+                "arguments": args,
+            },
+        })
+    return result
+
+
 def process_response(api_key: str, model: str, messages: list) -> str:
     """Agentic loop dengan streaming: print teks live, handle tool_calls."""
     while True:
@@ -639,7 +779,7 @@ def process_response(api_key: str, model: str, messages: list) -> str:
         tool_calls    = []
         printed_label = False
 
-        for chunk in call_api_stream(model, messages):
+        for chunk in call_api_stream(model, messages, api_key):
             msg = chunk.get("message", {})
 
             # Streaming teks → print langsung token-per-token
@@ -709,7 +849,8 @@ def process_response(api_key: str, model: str, messages: list) -> str:
 
 def load_config() -> dict:
     return {
-        "api_key":       "",  # Ollama tidak butuh API key
+        "api_key":       os.environ.get("OPENROUTER_API_KEY", ""),
+        "provider":      os.environ.get("MY_AI_PROVIDER", ""),       # "ollama" / "openrouter"
         "default_model": os.environ.get("MY_AI_DEFAULT_MODEL", ""),
     }
 
@@ -720,6 +861,7 @@ def save_config(data: dict):
         for key, val in data.items():
             env_key = {
                 "api_key":       "OPENROUTER_API_KEY",
+                "provider":      "MY_AI_PROVIDER",
                 "default_model": "MY_AI_DEFAULT_MODEL",
             }.get(key, key.upper())
             found = False
@@ -806,28 +948,31 @@ def fetch_ollama_models() -> list:
 
 
 def pilih_model(default_model: str = "") -> tuple:
-    detected = fetch_ollama_models()
+    global PROVIDER
 
-    # Susun daftar pilihan: model terdeteksi dulu, lalu fallback MODELS
-    options = {}
-    if detected:
-        for i, name in enumerate(detected, 1):
-            options[str(i)] = (name, name)
+    if PROVIDER == "openrouter":
+        options = dict(MODELS_OPENROUTER)
+        label   = "OpenRouter"
+        note    = "(cloud — butuh API key)"
     else:
-        options.update(MODELS)
+        detected = fetch_ollama_models()
+        if detected:
+            options = {str(i): (name, name) for i, name in enumerate(detected, 1)}
+            note    = "(terdeteksi dari 'ollama list')"
+        else:
+            options = dict(MODELS_OLLAMA)
+            note    = "(fallback — Ollama tidak terdeteksi)"
+        label = "Ollama"
 
-    custom_key = str(len(options) + 1)
+    custom_key  = str(len(options) + 1)
+    default_key = next((k for k, (mid, _) in options.items() if mid == default_model), "1")
 
-    # Cari nomor default
-    default_key = next((k for k,(mid,_) in options.items() if mid == default_model), "1")
-
-    print(f"{BOLD}Pilih model:{R}")
-    if detected:
-        print(f"  {DIM}(terdeteksi dari 'ollama list'){R}")
-    for k,(mid,desc) in options.items():
+    print(f"{BOLD}Pilih model {CYAN}[{label}]{R}:{R}")
+    print(f"  {DIM}{note}{R}")
+    for k, (mid, desc) in options.items():
         marker = f"  {GREEN}← tersimpan{R}" if mid == default_model else ""
         print(f"  {CYAN}{k}{R}. {desc}{marker}")
-    print(f"  {CYAN}{custom_key}{R}. Ketik model ID sendiri (contoh: llama3.1:8b, mistral)\n")
+    print(f"  {CYAN}{custom_key}{R}. Ketik model ID sendiri\n")
 
     while True:
         p = input(f"{DIM}Pilih [1-{custom_key}, default={default_key}]: {R}").strip() or default_key
@@ -836,11 +981,12 @@ def pilih_model(default_model: str = "") -> tuple:
             save_config({"default_model": mid})
             print(f"\n{GREEN}✓ {desc}{R}\n"); return mid, desc
         elif p == custom_key:
-            mid = input("Model ID (misal llama3.1:8b): ").strip()
+            mid = input("Model ID (contoh: mistralai/mixtral-8x7b-instruct): ").strip()
             if mid:
                 save_config({"default_model": mid})
                 print(f"\n{GREEN}✓ {mid}{R}\n"); return mid, mid
-        else: print(f"{RED}Tidak valid.{R}")
+        else:
+            print(f"{RED}Tidak valid.{R}")
 
 
 def save_to_txt(messages: list, persona: str, model: str):
@@ -874,8 +1020,8 @@ def help_text():
   {CYAN}/cwd{R}      — Tampilkan & ganti working directory
   {CYAN}/tools{R}    — Lihat tools yang tersedia
   {CYAN}/save{R}     — Export percakapan ke .txt
-  {CYAN}/apikey{R}   — Ganti & simpan API key
-  {CYAN}/info{R}     — Info model & persona aktif
+  {CYAN}/apikey{R}   — Set/ganti OpenRouter API key (tidak diperlukan untuk Ollama)
+  {CYAN}/info{R}     — Info provider, model & persona aktif
   {CYAN}/help{R}     — Pesan ini
   {CYAN}/exit{R}     — Keluar
 
@@ -885,29 +1031,81 @@ def help_text():
   {DIM}"cari semua fungsi yang pakai requests di folder ini"{R}
   {DIM}"buat file config.json dengan isi ..."{R}
   {DIM}"cari di internet cara install flask"{R}
+
+{BOLD}Provider:{R}
+  {CYAN}Ollama{R}      — Jalankan model lokal. Butuh: ollama serve
+  {CYAN}OpenRouter{R}  — 300+ model cloud (termasuk gratis). Butuh: API key dari openrouter.ai/keys
 """)
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    global PROVIDER
+
     print(f"\n{BOLD}{CYAN}{'═'*54}{R}")
-    print(f"{BOLD}{CYAN}   🤖  My AI CLI  —  Ollama + Tools{R}")
+    print(f"{BOLD}{CYAN}   🤖  My AI CLI  —  Ollama / OpenRouter + Tools{R}")
     print(f"{BOLD}{CYAN}{'═'*54}{R}\n")
 
     cfg = load_config()
 
-    # Cek apakah Ollama berjalan
-    try:
-        ping = requests.get("http://localhost:11434/api/tags", timeout=5)
-        if ping.ok:
-            print(f"{GREEN}✓ Ollama terhubung{R}")
-        else:
-            print(f"{YELLOW}⚠ Ollama merespons dengan status {ping.status_code}{R}")
-    except requests.exceptions.ConnectionError:
-        print(f"{RED}❌ Ollama tidak berjalan. Jalankan: ollama serve{R}\n")
-        return
+    # ── Pilih provider ──────────────────────────────────────────────────────
+    saved_provider = cfg.get("provider", "")
+    ollama_ok      = False
 
-    api_key = ""  # Ollama tidak butuh API key
+    # Cek apakah Ollama bisa dijangkau
+    try:
+        ping = requests.get("http://localhost:11434/api/tags", timeout=3)
+        ollama_ok = ping.ok
+    except Exception:
+        pass
+
+    print(f"{BOLD}Pilih provider:{R}")
+    ollama_mark = f"  {GREEN}← terdeteksi{R}" if ollama_ok else f"  {DIM}(tidak berjalan){R}"
+    or_mark     = f"  {GREEN}← tersimpan{R}" if saved_provider == "openrouter" else ""
+    ol_mark     = (f"  {GREEN}← tersimpan{R}" if saved_provider == "ollama" else "") + ollama_mark
+    print(f"  {CYAN}1{R}. Ollama  (lokal){ol_mark}")
+    print(f"  {CYAN}2{R}. OpenRouter (cloud){or_mark}\n")
+
+    default_prov = "1" if (saved_provider == "ollama" or not saved_provider) else "2"
+    prov_input   = input(f"{DIM}Pilih [1/2, default={default_prov}]: {R}").strip() or default_prov
+
+    if prov_input == "2":
+        PROVIDER = "openrouter"
+        save_config({"provider": "openrouter"})
+        print(f"\n{GREEN}✓ Provider: OpenRouter{R}")
+
+        # Minta / tampilkan API key
+        api_key = cfg.get("api_key", "")
+        if api_key:
+            masked = api_key[:8] + "…" + api_key[-4:]
+            print(f"  {DIM}API key tersimpan: {masked}{R}")
+            ganti = input(f"  Ganti API key? [y/N]: ").strip().lower()
+            if ganti == "y":
+                api_key = input(f"  Masukkan OPENROUTER_API_KEY baru: ").strip()
+                if api_key:
+                    save_config({"api_key": api_key})
+                    print(f"  {GREEN}✓ API key disimpan.{R}")
+        else:
+            print(f"\n  {YELLOW}⚠ OPENROUTER_API_KEY belum diset.{R}")
+            print(f"  Daftar gratis di {CYAN}https://openrouter.ai/keys{R}")
+            api_key = input(f"  Masukkan API key (kosongkan=skip): ").strip()
+            if api_key:
+                save_config({"api_key": api_key})
+                print(f"  {GREEN}✓ API key disimpan ke .env{R}")
+            else:
+                print(f"  {DIM}Lanjut tanpa API key (akan error saat memanggil model).{R}")
+        print()
+    else:
+        PROVIDER = "ollama"
+        save_config({"provider": "ollama"})
+        api_key  = ""
+        if ollama_ok:
+            print(f"{GREEN}✓ Provider: Ollama (terhubung){R}")
+        else:
+            print(f"{YELLOW}⚠ Provider: Ollama — server tidak terdeteksi. Jalankan: ollama serve{R}")
+            if not yn("Tetap lanjutkan?"):
+                return
+        print()
 
     default_model = cfg.get("default_model", "")
     model_id, model_desc = pilih_model(default_model)
@@ -978,7 +1176,7 @@ def main():
                 model_id, model_desc = pilih_model(default_model)
                 messages = [system_msg]
                 current_session_idx = None
-                print(f"{DIM}Konteks direset.{R}")
+                print(f"{DIM}Konteks direset. Provider: {'OpenRouter' if PROVIDER == 'openrouter' else 'Ollama'}{R}")
 
             elif cmd == "/cwd":
                 parts = user_input.split(maxsplit=1)
@@ -1025,7 +1223,23 @@ def main():
                 else: print(f"\n{YELLOW}Belum ada percakapan.{R}")
 
             elif cmd == "/apikey":
-                print(f"\n{YELLOW}Ollama berjalan lokal, tidak memerlukan API key.{R}\n")
+                if PROVIDER == "ollama":
+                    print(f"\n{YELLOW}Ollama berjalan lokal, tidak memerlukan API key.{R}")
+                    print(f"{DIM}Untuk menggunakan OpenRouter, restart dan pilih provider OpenRouter.{R}\n")
+                else:
+                    parts = user_input.split(maxsplit=1)
+                    if len(parts) > 1:
+                        new_key = parts[1].strip()
+                    else:
+                        masked = api_key[:8] + "…" + api_key[-4:] if api_key else "(belum diset)"
+                        print(f"\n  API key saat ini: {DIM}{masked}{R}")
+                        new_key = input(f"  Masukkan OPENROUTER_API_KEY baru (kosongkan=batal): ").strip()
+                    if new_key:
+                        api_key = new_key
+                        save_config({"api_key": api_key})
+                        print(f"\n{GREEN}✓ API key disimpan.{R}\n")
+                    else:
+                        print(f"\n{YELLOW}Dibatalkan.{R}\n")
 
             elif cmd == "/voice":
                 global VOICE_ENABLED, VOICEVOX_SPEAKER
@@ -1070,7 +1284,9 @@ def main():
 
             elif cmd == "/info":
                 voice_status = f"{GREEN}ON{R}" if VOICE_ENABLED else f"{DIM}OFF{R}"
-                print(f"\n  Model  : {CYAN}{model_desc}{R}  {DIM}({model_id}){R}")
+                prov_label   = f"{CYAN}OpenRouter{R}" if PROVIDER == "openrouter" else f"{CYAN}Ollama{R}"
+                print(f"\n  Provider: {prov_label}")
+                print(f"  Model  : {CYAN}{model_desc}{R}  {DIM}({model_id}){R}")
                 print(f"  Persona: {CYAN}{PERSONA_NAMA}{R}")
                 print(f"  CWD    : {CYAN}{cwd}{R}")
                 print(f"  Voice  : {voice_status}\n")
@@ -1089,7 +1305,11 @@ def main():
         except ValueError as e:
             print(f"\n{RED}❌ {e}{R}\n"); messages.pop(); continue
         except requests.exceptions.ConnectionError:
-            print(f"\n{RED}❌ Tidak bisa terhubung ke Ollama. Pastikan 'ollama serve' berjalan.{R}\n"); messages.pop(); continue
+            if PROVIDER == "openrouter":
+                print(f"\n{RED}❌ Tidak bisa terhubung ke OpenRouter. Cek koneksi internet.{R}\n")
+            else:
+                print(f"\n{RED}❌ Tidak bisa terhubung ke Ollama. Pastikan 'ollama serve' berjalan.{R}\n")
+            messages.pop(); continue
         except Exception as e:
             print(f"\n{RED}❌ Error: {e}{R}\n"); messages.pop(); continue
 
